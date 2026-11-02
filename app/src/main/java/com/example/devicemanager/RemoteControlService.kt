@@ -7,6 +7,7 @@ import android.net.Uri
 import android.provider.CallLog
 import android.view.accessibility.AccessibilityEvent
 import fi.iki.elonen.NanoHTTPD
+import java.io.ByteArrayInputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -112,20 +113,18 @@ class RemoteControlService : AccessibilityService() {
             val uri = session.uri
             val params = session.parameters
 
-            // Global Actions (Back, Home, Recents, Lock, Screenshot)
+            // 1. Navigation Action Handlers
             if (uri == "/key") {
-                val action = params["action"]?.firstOrNull()
-                val success = when (action) {
+                when (params["action"]?.firstOrNull()) {
                     "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
                     "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
                     "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
                     "lock" -> performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
-                    "screenshot" -> performGlobalAction(GLOBAL_ACTION_TAKE_SCREENSHOT)
-                    else -> false
                 }
-                return newFixedLengthResponse(if (success) "Action executed" else "Action failed")
+                return newFixedLengthResponse("OK")
             }
 
+            // 2. Launch Application
             if (uri == "/launch") {
                 val pkg = params["pkg"]?.firstOrNull()
                 if (!pkg.isNullOrEmpty()) {
@@ -140,9 +139,30 @@ class RemoteControlService : AccessibilityService() {
                 }
             }
 
+            // 3. Screen Frame Endpoint
+            if (uri == "/api/screen") {
+                val bytes = ScreenCaptureService.latestJpegBytes
+                return if (bytes != null && bytes.isNotEmpty()) {
+                    val res = newFixedLengthResponse(
+                        Response.Status.OK,
+                        "image/jpeg",
+                        ByteArrayInputStream(bytes),
+                        bytes.size.toLong()
+                    )
+                    res.addHeader("Cache-Control", "no-cache, no-store, must-revalidate")
+                    res.addHeader("Pragma", "no-cache")
+                    res.addHeader("Expires", "0")
+                    res
+                } else {
+                    newFixedLengthResponse(Response.Status.NO_CONTENT, "text/plain", "Waiting for capture frame...")
+                }
+            }
+
+            // 4. Data Endpoints
             if (uri == "/api/sms") return newFixedLengthResponse(Response.Status.OK, "text/html", getSmsHtml())
             if (uri == "/api/calls") return newFixedLengthResponse(Response.Status.OK, "text/html", getCallLogsHtml())
 
+            // 5. Installed Apps
             val pm = packageManager
             val packages = pm.getInstalledApplications(PackageManager.GET_META_DATA)
                 .filter { pm.getLaunchIntentForPackage(it.packageName) != null }
@@ -157,6 +177,7 @@ class RemoteControlService : AccessibilityService() {
                         .append("')\">Open</button></li>")
             }
 
+            // 6. Web Dashboard
             val html = """
                 <!DOCTYPE html>
                 <html>
@@ -165,9 +186,8 @@ class RemoteControlService : AccessibilityService() {
                     <title>Device Hub</title>
                     <style>
                         body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #121212; color: #fff; margin: 0; padding: 16px; }
-                        .nav-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; background: #1e1e1e; padding: 10px; border-radius: 8px; }
+                        .nav-bar { display: flex; gap: 8px; margin-bottom: 16px; background: #1e1e1e; padding: 10px; border-radius: 8px; }
                         button { background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 10px 14px; font-weight: bold; cursor: pointer; }
-                        .btn-screenshot { background: #059669; }
                         .tab-btn { background: #2d2d2d; flex: 1; text-align: center; }
                         .active { background: #2563eb !important; }
                         .card { background: #1e1e1e; padding: 12px; margin: 8px 0; border-radius: 8px; border-left: 4px solid #2563eb; }
@@ -175,20 +195,22 @@ class RemoteControlService : AccessibilityService() {
                         li { background: #1e1e1e; padding: 12px; margin: 8px 0; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; }
                         .tab-pane { display: none; }
                         .show { display: block; }
-                        #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #333; color: #fff; padding: 10px 18px; border-radius: 20px; display: none; font-size: 14px; }
+                        .screen-box { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+                        #screenImg { width: 100%; max-width: 320px; border-radius: 12px; border: 2px solid #333; background: #000; min-height: 480px; object-fit: contain; }
+                        #statusText { font-size: 13px; color: #888; }
                     </style>
                 </head>
                 <body>
                     <div class="nav-bar">
-                        <button onclick="sendKey('back')">Back</button>
-                        <button onclick="sendKey('home')">Home</button>
-                        <button onclick="sendKey('recents')">Recents</button>
-                        <button class="btn-screenshot" onclick="sendKey('screenshot')">Screenshot</button>
-                        <button onclick="sendKey('lock')" style="background:#dc2626;">Lock</button>
+                        <button onclick="fetch('/key?action=back')">Back</button>
+                        <button onclick="fetch('/key?action=home')">Home</button>
+                        <button onclick="fetch('/key?action=recents')">Recents</button>
+                        <button onclick="fetch('/key?action=lock')" style="background:#dc2626;">Lock</button>
                     </div>
 
-                    <div style="display:flex; gap:8px; margin-bottom:16px;">
+                    <div style="display:flex; gap:6px; margin-bottom:16px;">
                         <button class="tab-btn active" onclick="switchTab('apps', this)">Apps</button>
+                        <button class="tab-btn" onclick="openScreenTab(this)">Screen</button>
                         <button class="tab-btn" onclick="loadTab('sms', this)">Messages</button>
                         <button class="tab-btn" onclick="loadTab('calls', this)">Calls</button>
                     </div>
@@ -197,27 +219,26 @@ class RemoteControlService : AccessibilityService() {
                         <ul>$appsHtml</ul>
                     </div>
 
+                    <div id="screen" class="tab-pane">
+                        <div class="screen-box">
+                            <div style="display:flex; gap:10px; width: 100%; max-width: 320px;">
+                                <button id="streamBtn" style="flex:1" onclick="toggleStream()">Start Stream</button>
+                                <button style="background:#374151" onclick="fetchFrame()">Refresh</button>
+                            </div>
+                            <span id="statusText">Ready</span>
+                            <img id="screenImg" alt="Screen display" />
+                        </div>
+                    </div>
+
                     <div id="sms" class="tab-pane">Loading messages...</div>
                     <div id="calls" class="tab-pane">Loading call logs...</div>
 
-                    <div id="toast"></div>
-
                     <script>
-                        function showToast(text) {
-                            const toast = document.getElementById('toast');
-                            toast.innerText = text;
-                            toast.style.display = 'block';
-                            setTimeout(() => { toast.style.display = 'none'; }, 2000);
-                        }
-
-                        function sendKey(action) {
-                            fetch('/key?action=' + action)
-                                .then(r => r.text())
-                                .then(msg => showToast(action.toUpperCase() + ': ' + msg))
-                                .catch(err => showToast('Error: ' + err));
-                        }
+                        let streamInterval = null;
+                        let isFetching = false;
 
                         function switchTab(id, elem) {
+                            stopStream();
                             document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('show'));
                             document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
                             document.getElementById(id).classList.add('show');
@@ -229,13 +250,68 @@ class RemoteControlService : AccessibilityService() {
                             fetch('/api/' + id)
                                 .then(r => r.text())
                                 .then(html => { document.getElementById(id).innerHTML = html; })
-                                .catch(err => { document.getElementById(id).innerHTML = '<p>Failed to load data: ' + err + '</p>'; });
+                                .catch(err => { document.getElementById(id).innerHTML = '<p>Failed to load: ' + err + '</p>'; });
+                        }
+
+                        function openScreenTab(elem) {
+                            switchTab('screen', elem);
+                            fetchFrame();
+                        }
+
+                        function fetchFrame() {
+                            if (isFetching) return;
+                            isFetching = true;
+                            const status = document.getElementById('statusText');
+
+                            fetch('/api/screen?t=' + Date.now())
+                                .then(res => {
+                                    if (res.status === 204) throw new Error("Waiting for capture permission...");
+                                    if (!res.ok) throw new Error("Server error " + res.status);
+                                    return res.blob();
+                                })
+                                .then(blob => {
+                                    const img = document.getElementById('screenImg');
+                                    if (img.src.startsWith('blob:')) {
+                                        URL.revokeObjectURL(img.src);
+                                    }
+                                    img.src = URL.createObjectURL(blob);
+                                    status.innerText = "Updated: " + new Date().toLocaleTimeString();
+                                    isFetching = false;
+                                })
+                                .catch(err => {
+                                    status.innerText = err.message;
+                                    isFetching = false;
+                                });
+                        }
+
+                        function toggleStream() {
+                            const btn = document.getElementById('streamBtn');
+                            if (streamInterval) {
+                                stopStream();
+                            } else {
+                                btn.innerText = "Stop Stream";
+                                btn.style.background = "#dc2626";
+                                fetchFrame();
+                                streamInterval = setInterval(fetchFrame, 800);
+                            }
+                        }
+
+                        function stopStream() {
+                            if (streamInterval) {
+                                clearInterval(streamInterval);
+                                streamInterval = null;
+                                const btn = document.getElementById('streamBtn');
+                                if (btn) {
+                                    btn.innerText = "Start Stream";
+                                    btn.style.background = "#2563eb";
+                                }
+                            }
                         }
 
                         function launchApp(pkg) {
                             fetch('/launch?pkg=' + pkg)
                                 .then(r => r.text())
-                                .then(msg => showToast(msg));
+                                .then(msg => alert(msg));
                         }
                     </script>
                 </body>
