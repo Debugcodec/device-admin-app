@@ -52,7 +52,6 @@ class RemoteControlService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
-
     override fun onInterrupt() {}
 
     private fun escapeHtml(input: String?): String {
@@ -118,7 +117,7 @@ class RemoteControlService : AccessibilityService() {
                 val durIdx = it.getColumnIndex(CallLog.Calls.DURATION)
 
                 while (it.moveToNext()) {
-                    val rawNumber = if (numIdx != -1) it.getString(numIdx) ?: "Unknown" else "Unknown"
+                    val rawNumber = if (numIdx != -1) it.getString(numIdx) ?: "Private Number" else "Private Number"
                     val rawName = if (nameIdx != -1) it.getString(nameIdx) ?: rawNumber else rawNumber
                     val rawType = if (typeIdx != -1) it.getInt(typeIdx) else -1
                     val rawDate = if (dateIdx != -1) it.getLong(dateIdx) else 0L
@@ -128,6 +127,7 @@ class RemoteControlService : AccessibilityService() {
                         CallLog.Calls.INCOMING_TYPE -> "Incoming"
                         CallLog.Calls.OUTGOING_TYPE -> "Outgoing"
                         CallLog.Calls.MISSED_TYPE -> "Missed"
+                        CallLog.Calls.REJECTED_TYPE -> "Rejected"
                         else -> "Call"
                     }
 
@@ -141,7 +141,7 @@ class RemoteControlService : AccessibilityService() {
                 }
             }
         } catch (e: Exception) {
-            return "<div class='card'><p>Error reading call logs: ${escapeHtml(e.message)}</p></div>"
+            return "<div class='card'><p>Error reading call logs: ${escapeHtml(e.message)}<br><small>Grant Call Logs runtime permission.</small></p></div>"
         }
         return if (sb.isEmpty()) "<div class='card'><p>No call logs found.</p></div>" else sb.toString()
     }
@@ -155,7 +155,7 @@ class RemoteControlService : AccessibilityService() {
                     .append(")</small><p>").append(escapeHtml(item.text)).append("</p></div>")
             }
         }
-        return if (sb.isEmpty()) "<div class='card'><p>No notifications captured yet.</p></div>" else sb.toString()
+        return if (sb.isEmpty()) "<div class='card'><p>No notifications captured yet.<br><small>Ensure Notification Access is enabled in Android Settings.</small></p></div>" else sb.toString()
     }
 
     inner class WebServer(port: Int) : NanoHTTPD(port) {
@@ -163,7 +163,6 @@ class RemoteControlService : AccessibilityService() {
             val uri = session.uri
             val params = session.parameters
 
-            // 1. Navigation Action Handlers
             if (uri == "/key") {
                 val action = params["action"]?.firstOrNull()
                 when (action) {
@@ -179,7 +178,6 @@ class RemoteControlService : AccessibilityService() {
                 return newFixedLengthResponse("OK")
             }
 
-            // 2. Launch Application Handler
             if (uri == "/launch") {
                 val pkg = params["pkg"]?.firstOrNull()
                 if (!pkg.isNullOrEmpty()) {
@@ -195,12 +193,10 @@ class RemoteControlService : AccessibilityService() {
                 }
             }
 
-            // 3. Dynamic AJAX Data Endpoints
             if (uri == "/api/sms") return newFixedLengthResponse(Response.Status.OK, "text/html", getSmsHtml())
             if (uri == "/api/calls") return newFixedLengthResponse(Response.Status.OK, "text/html", getCallLogsHtml())
             if (uri == "/api/notifs") return newFixedLengthResponse(Response.Status.OK, "text/html", getNotificationsHtml())
 
-            // 4. Installed Apps List
             val pm = packageManager
             val packages = pm.getInstalledApplications(PackageManager.GET_META_DATA)
                 .filter { pm.getLaunchIntentForPackage(it.packageName) != null }
@@ -215,7 +211,6 @@ class RemoteControlService : AccessibilityService() {
                     .append("')\">Open</button></li>")
             }
 
-            // 5. Dashboard HTML Page
             val html = """
                 <!DOCTYPE html>
                 <html>
