@@ -6,8 +6,7 @@ import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.provider.Settings
-import android.util.DisplayMetrics
-import android.widget.Button
+import android.text.TextUtils
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import java.net.Inet4Address
@@ -16,8 +15,8 @@ import java.util.Collections
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var ipTextView: TextView
     private val SCREEN_CAPTURE_REQUEST = 1001
+    private var captureRequested = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -27,32 +26,50 @@ class MainActivity : AppCompatActivity() {
             setPadding(50, 80, 50, 50)
         }
 
-        ipTextView = TextView(this).apply {
-            textSize = 20f
-            setPadding(0, 0, 0, 30)
-        }
-
-        val btnStartStream = Button(this).apply {
-            text = "Start Screen Sharing"
-            setOnClickListener {
-                val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                startActivityForResult(mgr.createScreenCaptureIntent(), SCREEN_CAPTURE_REQUEST)
-            }
-        }
-
-        val btnOpenAccessibility = Button(this).apply {
-            text = "Enable Accessibility Service"
-            setOnClickListener {
-                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-            }
+        val ipTextView = TextView(this).apply {
+            textSize = 22f
+            text = "Remote Controller Active\n\nOpen on Phone A:\nhttp://${getDeviceIp()}:8080"
         }
 
         layout.addView(ipTextView)
-        layout.addView(btnStartStream)
-        layout.addView(btnOpenAccessibility)
         setContentView(layout)
+    }
 
-        updateIpDisplay()
+    override fun onResume() {
+        super.onResume()
+        checkAndStartPermissions()
+    }
+
+    private fun checkAndStartPermissions() {
+        if (!isAccessibilityServiceEnabled()) {
+            // Auto-redirect to Accessibility settings if not enabled
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            return
+        }
+
+        // Once accessibility is ready, auto-prompt for screen capture
+        if (!captureRequested && RemoteControlService.mediaProjection == null) {
+            captureRequested = true
+            val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            startActivityForResult(mgr.createScreenCaptureIntent(), SCREEN_CAPTURE_REQUEST)
+        }
+    }
+
+    private fun isAccessibilityServiceEnabled(): Boolean {
+        val expectedServiceName = "$packageName/${RemoteControlService::class.java.canonicalName}"
+        val enabledServices = Settings.Secure.getString(
+            contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ) ?: return false
+
+        val colonSplitter = TextUtils.SimpleStringSplitter(':')
+        colonSplitter.setString(enabledServices)
+        while (colonSplitter.hasNext()) {
+            if (colonSplitter.next().equals(expectedServiceName, ignoreCase = true)) {
+                return true
+            }
+        }
+        return false
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -68,11 +85,6 @@ class MainActivity : AppCompatActivity() {
                 metrics.densityDpi
             )
         }
-    }
-
-    private fun updateIpDisplay() {
-        val ip = getDeviceIp()
-        ipTextView.text = "Open on Phone A:\nhttp://$ip:8080"
     }
 
     private fun getDeviceIp(): String {

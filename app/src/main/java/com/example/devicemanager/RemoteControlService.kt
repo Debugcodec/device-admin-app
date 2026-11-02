@@ -2,8 +2,13 @@ package com.example.devicemanager
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.PixelFormat
@@ -11,14 +16,14 @@ import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
 import android.media.projection.MediaProjection
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.util.DisplayMetrics
 import android.view.accessibility.AccessibilityEvent
+import androidx.core.app.NotificationCompat
 import fi.iki.elonen.NanoHTTPD
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
-import java.io.InputStream
 
 class RemoteControlService : AccessibilityService() {
 
@@ -33,6 +38,8 @@ class RemoteControlService : AccessibilityService() {
         var screenDensity: Int = 320
         var screenWidth: Int = 720
         var screenHeight: Int = 1280
+        const val CHANNEL_ID = "remote_control_channel"
+        const val NOTIFICATION_ID = 101
     }
 
     override fun onServiceConnected() {
@@ -50,7 +57,33 @@ class RemoteControlService : AccessibilityService() {
 
     fun startScreenCapture(projection: MediaProjection, width: Int, height: Int, density: Int) {
         mediaProjection = projection
-        // Scale down resolution slightly for low-latency Wi-Fi streaming
+
+        // 1. Create Notification Channel
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Remote Control Stream",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(channel)
+        }
+
+        // 2. Start Foreground Service (Required for MediaProjection on Android 10-14)
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Remote Controller Active")
+            .setContentText("Screen stream is running")
+            .setSmallIcon(android.R.drawable.presence_online)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+
+        // 3. Set display scaling (half-resolution for fluid network speed)
         screenWidth = width / 2
         screenHeight = height / 2
         screenDensity = density
@@ -99,7 +132,6 @@ class RemoteControlService : AccessibilityService() {
     }
 
     fun injectTap(x: Float, y: Float) {
-        // Map from scaled web coordinates back to physical screen pixels
         val targetX = x * 2f
         val targetY = y * 2f
         val path = Path().apply { moveTo(targetX, targetY) }
@@ -163,7 +195,6 @@ class RemoteControlService : AccessibilityService() {
                 )
             }
 
-            // Interactive screen display dashboard
             val html = """
                 <!DOCTYPE html>
                 <html>
@@ -184,16 +215,13 @@ class RemoteControlService : AccessibilityService() {
                         <button onclick="fetch('/key?action=recents')">Recents</button>
                         <button onclick="fetch('/key?action=lock')" style="background:#dc2626;">Lock</button>
                     </div>
-                    <img id="screen" src="/frame" alt="Waiting for screen share...">
+                    <img id="screen" src="/frame" alt="Waiting for screen stream...">
                     <script>
                         const img = document.getElementById('screen');
-                        
-                        // Live screen refresh loop
                         setInterval(() => {
                             img.src = '/frame?t=' + Date.now();
                         }, 120);
 
-                        // Capture clicks/taps on Phone A and forward coordinates
                         img.addEventListener('pointerdown', (e) => {
                             const rect = img.getBoundingClientRect();
                             const scaleX = img.naturalWidth / rect.width;
