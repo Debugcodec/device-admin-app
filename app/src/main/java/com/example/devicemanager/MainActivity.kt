@@ -1,47 +1,54 @@
 package com.example.devicemanager
 
-import android.app.admin.DevicePolicyManager
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.wifi.WifiManager
 import android.os.Bundle
+import android.provider.Settings
 import android.widget.Button
-import android.widget.Toast
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import java.net.InetAddress
+import java.nio.ByteOrder
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var devicePolicyManager: DevicePolicyManager
-    private lateinit var compName: ComponentName
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
 
-        devicePolicyManager = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
-        compName = ComponentName(this, AdminReceiver::class.java)
+        val layout = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(50, 80, 50, 50)
+        }
 
-        val btnEnable = findViewById<Button>(R.id.btnEnableAdmin)
-        val btnLock = findViewById<Button>(R.id.btnLockScreen)
+        val ipTextView = TextView(this).apply {
+            textSize = 18f
+            text = "Connect from Phone A at:\nhttp://${getDeviceIp()}:8080"
+        }
 
-        btnEnable.setOnClickListener {
-            if (!devicePolicyManager.isAdminActive(compName)) {
-                val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
-                    putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, compName)
-                    putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "Administrative privileges are required to lock this device.")
-                }
-                startActivity(intent)
-            } else {
-                Toast.makeText(this, "Admin is already active", Toast.LENGTH_SHORT).show()
+        val btnOpenAccessibility = Button(this).apply {
+            text = "Enable Accessibility Service"
+            setOnClickListener {
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             }
         }
 
-        btnLock.setOnClickListener {
-            if (devicePolicyManager.isAdminActive(compName)) {
-                devicePolicyManager.lockNow()
-            } else {
-                Toast.makeText(this, "Please enable admin privileges first", Toast.LENGTH_SHORT).show()
+        layout.addView(ipTextView)
+        layout.addView(btnOpenAccessibility)
+        setContentView(layout)
+    }
+
+    private fun getDeviceIp(): String {
+        return try {
+            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            var ip = wifiManager.connectionInfo.ipAddress
+            if (ByteOrder.nativeOrder().equals(ByteOrder.LITTLE_ENDIAN)) {
+                ip = Integer.reverseBytes(ip)
             }
+            val ipByteArray = java.math.BigInteger.valueOf(ip.toLong()).toByteArray()
+            InetAddress.getByAddress(ipByteArray).hostAddress ?: "127.0.0.1"
+        } catch (e: Exception) {
+            "Unknown IP"
         }
     }
 }
