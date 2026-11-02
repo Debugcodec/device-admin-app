@@ -1,89 +1,101 @@
 package com.example.devicemanager
 
-import android.app.Activity
-import android.content.Context
+import android.Manifest
 import android.content.Intent
-import android.media.projection.MediaProjectionManager
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.text.TextUtils
+import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.Collections
 
 class MainActivity : AppCompatActivity() {
 
-    private val SCREEN_CAPTURE_REQUEST = 1001
-    private var captureRequested = false
+    private lateinit var ipTextView: TextView
+
+    private val requestPermissionsLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val allGranted = permissions.entries.all { it.value }
+        if (allGranted) {
+            Toast.makeText(this, "Permissions granted", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, "Some permissions were denied", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val layout = android.widget.LinearLayout(this).apply {
-            orientation = android.widget.LinearLayout.VERTICAL
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             setPadding(50, 80, 50, 50)
         }
 
-        val ipTextView = TextView(this).apply {
-            textSize = 22f
+        ipTextView = TextView(this).apply {
+            textSize = 20f
             text = "Remote Controller Active\n\nOpen on Phone A:\nhttp://${getDeviceIp()}:8080"
+            setPadding(0, 0, 0, 40)
+        }
+
+        val btnRequestPerms = Button(this).apply {
+            text = "1. Grant SMS & Call Permissions"
+            setOnClickListener { checkAndRequestPermissions() }
+        }
+
+        val btnNotificationAccess = Button(this).apply {
+            text = "2. Enable Notification Listener"
+            setOnClickListener {
+                startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+            }
+        }
+
+        val btnAccessibilityAccess = Button(this).apply {
+            text = "3. Enable Accessibility Service"
+            setOnClickListener {
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            }
         }
 
         layout.addView(ipTextView)
+        layout.addView(btnRequestPerms)
+        layout.addView(btnNotificationAccess)
+        layout.addView(btnAccessibilityAccess)
         setContentView(layout)
+
+        checkAndRequestPermissions()
     }
 
     override fun onResume() {
         super.onResume()
-        checkAndStartPermissions()
+        ipTextView.text = "Remote Controller Active\n\nOpen on Phone A:\nhttp://${getDeviceIp()}:8080"
     }
 
-    private fun checkAndStartPermissions() {
-        if (!isAccessibilityServiceEnabled()) {
-            // Auto-redirect to Accessibility settings if not enabled
-            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-            return
+    private fun checkAndRequestPermissions() {
+        val perms = mutableListOf(
+            Manifest.permission.READ_SMS,
+            Manifest.permission.READ_CALL_LOG,
+            Manifest.permission.READ_CONTACTS
+        )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            perms.add(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        // Once accessibility is ready, auto-prompt for screen capture
-        if (!captureRequested && RemoteControlService.mediaProjection == null) {
-            captureRequested = true
-            val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            startActivityForResult(mgr.createScreenCaptureIntent(), SCREEN_CAPTURE_REQUEST)
+        val missing = perms.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
-    }
 
-    private fun isAccessibilityServiceEnabled(): Boolean {
-        val expectedServiceName = "$packageName/${RemoteControlService::class.java.canonicalName}"
-        val enabledServices = Settings.Secure.getString(
-            contentResolver,
-            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-        ) ?: return false
-
-        val colonSplitter = TextUtils.SimpleStringSplitter(':')
-        colonSplitter.setString(enabledServices)
-        while (colonSplitter.hasNext()) {
-            if (colonSplitter.next().equals(expectedServiceName, ignoreCase = true)) {
-                return true
-            }
-        }
-        return false
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == SCREEN_CAPTURE_REQUEST && resultCode == Activity.RESULT_OK && data != null) {
-            val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            val projection = mgr.getMediaProjection(resultCode, data)
-            val metrics = resources.displayMetrics
-            RemoteControlService.instance?.startScreenCapture(
-                projection,
-                metrics.widthPixels,
-                metrics.heightPixels,
-                metrics.densityDpi
-            )
+        if (missing.isNotEmpty()) {
+            requestPermissionsLauncher.launch(missing.toTypedArray())
         }
     }
 
